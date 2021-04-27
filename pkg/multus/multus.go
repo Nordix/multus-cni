@@ -29,8 +29,10 @@ import (
 	"github.com/containernetworking/cni/pkg/invoke"
 	"github.com/containernetworking/cni/pkg/skel"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
+	"github.com/containernetworking/cni/pkg/types/current"
 	cnicurrent "github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/plugins/pkg/ns"
+	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	nettypes "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	nadutils "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/utils"
 	"github.com/vishvananda/netlink"
@@ -656,12 +658,14 @@ func CmdAdd(args *skel.CmdArgs, exec invoke.Exec, kubeClient *k8s.ClientInfo) (c
 		// create the network status, only in case Multus as kubeconfig
 		if n.Kubeconfig != "" && kc != nil {
 			if !types.CheckSystemNamespaces(string(k8sArgs.K8S_POD_NAME), n.SystemNamespaces) {
-				delegateNetStatus, err := nadutils.CreateNetworkStatus(tmpResult, delegate.Name, delegate.MasterPlugin, devinfo)
+				// TODO: use nadutils.CreateNetworkStatus
+				delegateNetStatuses, err := CreateNetworkStatus(tmpResult, delegate.Name, delegate.MasterPlugin, devinfo)
 				if err != nil {
 					return nil, cmdErr(k8sArgs, "error setting network status: %v", err)
 				}
-
-				netStatus = append(netStatus, *delegateNetStatus)
+				for _, delegateNetStatus := range delegateNetStatuses {
+					netStatus = append(netStatus, *delegateNetStatus)
+				}
 			}
 		} else if devinfo != nil {
 			// Warn that devinfo exists but could not add it to downwards API
@@ -683,6 +687,61 @@ func CmdAdd(args *skel.CmdArgs, exec invoke.Exec, kubeClient *k8s.ClientInfo) (c
 	}
 
 	return result, nil
+}
+
+// CreateNetworkStatus create NetworkStatus from CNI result
+func CreateNetworkStatus(r cnitypes.Result, networkName string, defaultNetwork bool, dev *nadv1.DeviceInfo) ([]*nadv1.NetworkStatus, error) {
+	netStatuses := make([]*nadv1.NetworkStatus, 0)
+
+	// Convert whatever the IPAM result was into the current Result type
+	result, err := current.NewResultFromResult(r)
+	if err != nil {
+		return netStatuses, fmt.Errorf("error convert the type.Result to current.Result: %v", err)
+	}
+
+	v1dns := convertDNS(result.DNS)
+	for ifIdx, ifs := range result.Interfaces {
+		netStatus := &nadv1.NetworkStatus{}
+		netStatus.Name = networkName
+		netStatus.Default = defaultNetwork
+		// Only pod interfaces can have sandbox information
+		if ifs.Sandbox == "" {
+			netStatus.Interface = ifs.Name
+			netStatus.Mac = ifs.Mac
+		}
+
+		for _, ipconfig := range result.IPs {
+			ipIfPtr := ipconfig.Interface
+			if ipIfPtr == nil || *ipIfPtr == ifIdx {
+				if ipconfig.Version == "4" && ipconfig.Address.IP.To4() != nil {
+					netStatus.IPs = append(netStatus.IPs, ipconfig.Address.IP.String())
+				}
+
+				if ipconfig.Version == "6" && ipconfig.Address.IP.To16() != nil {
+					netStatus.IPs = append(netStatus.IPs, ipconfig.Address.IP.String())
+				}
+			}
+		}
+		netStatus.DNS = *v1dns
+		if dev != nil {
+			netStatus.DeviceInfo = dev
+		}
+		netStatuses = append(netStatuses, netStatus)
+	}
+
+	return netStatuses, nil
+}
+
+// convertDNS converts CNI's DNS type to client DNS
+func convertDNS(dns cnitypes.DNS) *nadv1.DNS {
+	var v1dns nadv1.DNS
+
+	v1dns.Nameservers = append([]string{}, dns.Nameservers...)
+	v1dns.Domain = dns.Domain
+	v1dns.Search = append([]string{}, dns.Search...)
+	v1dns.Options = append([]string{}, dns.Options...)
+
+	return &v1dns
 }
 
 //CmdCheck ...
